@@ -312,6 +312,7 @@ public class RpcServer implements RpcServerInterface, ConfigurationObserver {
 
     private User user;
     private InetAddress remoteAddress;
+    private boolean saslWrapDone;
 
     Call(int id, final BlockingService service, final MethodDescriptor md, RequestHeader header,
          Message param, CellScanner cellScanner, Connection connection, Responder responder,
@@ -332,6 +333,7 @@ public class RpcServer implements RpcServerInterface, ConfigurationObserver {
       this.tinfo = tinfo;
       this.user = connection.user == null? null: userProvider.create(connection.user);
       this.remoteAddress = remoteAddress;
+      saslWrapDone = false;
     }
 
     /**
@@ -438,13 +440,22 @@ public class RpcServer implements RpcServerInterface, ConfigurationObserver {
           (this.cellBlock == null? 0: this.cellBlock.limit());
         ByteBuffer bbTotalSize = ByteBuffer.wrap(Bytes.toBytes(totalSize));
         bc = new BufferChain(bbTotalSize, bbHeader, bbResult, this.cellBlock);
+        /* to make sure that messages are sent in the same order than Sasl sequence number, we must wrap the message when we put it in the response queue
         if (connection.useWrap) {
           bc = wrapWithSasl(bc);
         }
+        */
       } catch (IOException e) {
         LOG.warn("Exception while creating response " + e);
       }
       this.response = bc;
+    }
+
+    public synchronized void wrapWithSasl() throws IOException {
+      // do it only once per call
+      if (saslWrapDone == true) return;
+      response = wrapWithSasl(response);
+      saslWrapDone = true;
     }
 
     private BufferChain wrapWithSasl(BufferChain bc)
@@ -454,11 +465,14 @@ public class RpcServer implements RpcServerInterface, ConfigurationObserver {
       // THIS IS A BIG UGLY COPY.
       byte [] responseBytes = bc.getBytes();
       byte [] token;
+
+      // No lock on saslServer needed anymore:we are called only by the responder thread
+
       // synchronization may be needed since there can be multiple Handler
       // threads using saslServer to wrap responses.
-      synchronized (connection.saslServer) {
+      //synchronized (connection.saslServer) {
         token = connection.saslServer.wrap(responseBytes, 0, responseBytes.length);
-      }
+      //}
       if (LOG.isTraceEnabled()) {
         LOG.trace("Adding saslServer wrapped token of size " + token.length
             + " as call response.");
@@ -1103,6 +1117,9 @@ public class RpcServer implements RpcServerInterface, ConfigurationObserver {
     private boolean processResponse(final Call call) throws IOException {
       boolean error = true;
       try {
+        if (call.connection.useWrap) {
+          call.wrapWithSasl();
+        }
         // Send as much data as we can in the non-blocking fashion
         long numBytes = channelWrite(call.connection.channel, call.response);
         if (numBytes < 0) {
@@ -1135,6 +1152,7 @@ public class RpcServer implements RpcServerInterface, ConfigurationObserver {
      */
     private boolean processAllResponses(final Connection connection) throws IOException {
       // We want only one writer on the channel for a connection at a time.
+      boolean isEmpty = false;
       connection.responseWriteLock.lock();
       try {
         for (int i = 0; i < 20; i++) {
@@ -1148,11 +1166,13 @@ public class RpcServer implements RpcServerInterface, ConfigurationObserver {
             return false;
           }
         }
+        // Check that state within the lock to be consistent
+        isEmpty = connection.responseQueue.isEmpty();
       } finally {
         connection.responseWriteLock.unlock();
       }
 
-      return connection.responseQueue.isEmpty();
+      return isEmpty;
     }
 
     //
@@ -1163,8 +1183,9 @@ public class RpcServer implements RpcServerInterface, ConfigurationObserver {
 
       // If there is already a write in progress, we don't wait. This allows to free the handlers
       //  immediately for other tasks.
-      if (call.connection.responseQueue.isEmpty() && call.connection.responseWriteLock.tryLock()) {
-        try {
+      // If we use Sasl, always insert in the queue to ensure Sasl sequence number respect the network send order
+      // TODO: Another solution could be to synchronize (processResponse,addFirst(call)) with addLast(call) to keep the sequence order, if this optimisation is needed
+      if (!call.connection.useWrap &&  call.connection.responseQueue.isEmpty() && call.connection.responseWriteLock.tryLock()) {        try {
           if (call.connection.responseQueue.isEmpty()) {
             // If we're alone, we can try to do a direct call to the socket. It's
             //  an optimisation to save on context switches and data transfer between cores..
