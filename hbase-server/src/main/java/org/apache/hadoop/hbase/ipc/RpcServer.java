@@ -1183,9 +1183,8 @@ public class RpcServer implements RpcServerInterface, ConfigurationObserver {
 
       // If there is already a write in progress, we don't wait. This allows to free the handlers
       //  immediately for other tasks.
-      // If we use Sasl, always insert in the queue to ensure Sasl sequence number respect the network send order
-      // TODO: Another solution could be to synchronize (processResponse,addFirst(call)) with addLast(call) to keep the sequence order, if this optimisation is needed
-      if (!call.connection.useWrap &&  call.connection.responseQueue.isEmpty() && call.connection.responseWriteLock.tryLock()) {        try {
+      if (call.connection.responseQueue.isEmpty() && call.connection.responseWriteLock.tryLock()) {
+        try {
           if (call.connection.responseQueue.isEmpty()) {
             // If we're alone, we can try to do a direct call to the socket. It's
             //  an optimisation to save on context switches and data transfer between cores..
